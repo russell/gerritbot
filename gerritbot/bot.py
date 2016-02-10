@@ -76,7 +76,7 @@ irc.client.ServerConnection.buffer_class.errors = 'replace'
 
 
 class GerritBot(irc.bot.SingleServerIRCBot):
-    def __init__(self, channels, nickname, password, server, port=6667,
+    def __init__(self, config, nickname, password, server, port=6667,
                  force_ssl=False, server_password=None):
         if force_ssl or port == 6697:
             factory = irc.connection.Factory(wrapper=ssl.wrap_socket)
@@ -86,7 +86,8 @@ class GerritBot(irc.bot.SingleServerIRCBot):
         else:
             super(GerritBot, self).__init__([(server, port, server_password)],
                                             nickname, nickname)
-        self.channel_list = channels
+        self.config = config
+        self.channel_list = config.channels
         self.nickname = nickname
         self.password = password
         self.log = logging.getLogger('gerritbot')
@@ -110,6 +111,86 @@ class GerritBot(irc.bot.SingleServerIRCBot):
             self.log.info('Joined channel %s' % channel)
             time.sleep(0.5)
 
+    def patchset_created(self, channel, data):
+        msg = '%s proposed %s: %s  %s' % (
+            data['patchSet']['uploader']['name'],
+            data['change']['project'],
+            data['change']['subject'],
+            data['change']['url'])
+        self.log.info('Compiled Message %s: %s' % (channel, msg))
+        self.send(channel, msg)
+
+    def ref_updated(self, channel, data):
+        refName = data['refUpdate']['refName']
+        m = re.match(r'(refs/tags)/(.*)', refName)
+
+        if m:
+            tag = m.group(2)
+            msg = '%s tagged project %s with %s' % (
+                data['submitter']['username'],
+                data['refUpdate']['project'],
+                tag
+            )
+            self.log.info('Compiled Message %s: %s' % (channel, msg))
+            self.send(channel, msg)
+
+    def comment_added(self, channel, data):
+        msg = 'A comment has been added to a proposed change to %s: %s  %s' % (
+            data['change']['project'],
+            data['change']['subject'],
+            data['change']['url'])
+        self.log.info('Compiled Message %s: %s' % (channel, msg))
+        self.send(channel, msg)
+
+        for approval in data.get('approvals', []):
+            if (approval['type'] == 'VRIF' and approval['value'] == '-2'
+                and channel in self.channel_config.events.get(
+                    'x-vrif-minus-2', set())):
+                msg = 'Verification of a change to %s failed: %s  %s' % (
+                    data['change']['project'],
+                    data['change']['subject'],
+                    data['change']['url'])
+                self.log.info('Compiled Message %s: %s' % (channel, msg))
+                self.send(channel, msg)
+
+            if (approval['type'] == 'VRIF' and approval['value'] == '2'
+                and channel in self.channel_config.events.get(
+                    'x-vrif-plus-2', set())):
+                msg = 'Verification of a change to %s succeeded: %s  %s' % (
+                    data['change']['project'],
+                    data['change']['subject'],
+                    data['change']['url'])
+                self.log.info('Compiled Message %s: %s' % (channel, msg))
+                self.send(channel, msg)
+
+            if (approval['type'] == 'CRVW' and approval['value'] == '-2'
+                and channel in self.channel_config.events.get(
+                    'x-crvw-minus-2', set())):
+                msg = 'A change to %s has been rejected: %s  %s' % (
+                    data['change']['project'],
+                    data['change']['subject'],
+                    data['change']['url'])
+                self.log.info('Compiled Message %s: %s' % (channel, msg))
+                self.send(channel, msg)
+
+            if (approval['type'] == 'CRVW' and approval['value'] == '2'
+                and channel in self.channel_config.events.get(
+                    'x-crvw-plus-2', set())):
+                msg = 'A change to %s has been approved: %s  %s' % (
+                    data['change']['project'],
+                    data['change']['subject'],
+                    data['change']['url'])
+                self.log.info('Compiled Message %s: %s' % (channel, msg))
+                self.send(channel, msg)
+
+    def change_merged(self, channel, data):
+        msg = 'Merged %s: %s  %s' % (
+            data['change']['project'],
+            data['change']['subject'],
+            data['change']['url'])
+        self.log.info('Compiled Message %s: %s' % (channel, msg))
+        self.send(channel, msg)
+
     def send(self, channel, msg):
         self.log.info('Sending "%s" to %s' % (msg, channel))
         try:
@@ -119,13 +200,22 @@ class GerritBot(irc.bot.SingleServerIRCBot):
             self.log.exception('Exception sending message:')
             self.connection.reconnect()
 
+    def dispatch_event(self, channel, data):
+        if data['type'] == 'comment-added':
+            self.comment_added(channel, data)
+        elif data['type'] == 'patchset-created':
+            self.patchset_created(channel, data)
+        elif data['type'] == 'change-merged':
+            self.change_merged(channel, data)
+        elif data['type'] == 'ref-updated':
+            self.ref_updated(channel, data)
+
 
 class Gerrit(threading.Thread):
-    def __init__(self, ircbot, channel_config, server,
+    def __init__(self, bots, server,
                  username, port=29418, keyfile=None):
         super(Gerrit, self).__init__()
-        self.ircbot = ircbot
-        self.channel_config = channel_config
+        self.bots = bots
         self.log = logging.getLogger('gerritbot')
         self.server = server
         self.username = username
@@ -148,112 +238,28 @@ class Gerrit(threading.Thread):
             # Delay before attempting again.
             time.sleep(1)
 
-    def patchset_created(self, channel, data):
-        msg = '%s proposed %s: %s  %s' % (
-            data['patchSet']['uploader']['name'],
-            data['change']['project'],
-            data['change']['subject'],
-            data['change']['url'])
-        self.log.info('Compiled Message %s: %s' % (channel, msg))
-        self.ircbot.send(channel, msg)
-
-    def ref_updated(self, channel, data):
-        refName = data['refUpdate']['refName']
-        m = re.match(r'(refs/tags)/(.*)', refName)
-
-        if m:
-            tag = m.group(2)
-            msg = '%s tagged project %s with %s' % (
-                data['submitter']['username'],
-                data['refUpdate']['project'],
-                tag
-            )
-            self.log.info('Compiled Message %s: %s' % (channel, msg))
-            self.ircbot.send(channel, msg)
-
-    def comment_added(self, channel, data):
-        msg = 'A comment has been added to a proposed change to %s: %s  %s' % (
-            data['change']['project'],
-            data['change']['subject'],
-            data['change']['url'])
-        self.log.info('Compiled Message %s: %s' % (channel, msg))
-        self.ircbot.send(channel, msg)
-
-        for approval in data.get('approvals', []):
-            if (approval['type'] == 'VRIF' and approval['value'] == '-2'
-                and channel in self.channel_config.events.get(
-                    'x-vrif-minus-2', set())):
-                msg = 'Verification of a change to %s failed: %s  %s' % (
-                    data['change']['project'],
-                    data['change']['subject'],
-                    data['change']['url'])
-                self.log.info('Compiled Message %s: %s' % (channel, msg))
-                self.ircbot.send(channel, msg)
-
-            if (approval['type'] == 'VRIF' and approval['value'] == '2'
-                and channel in self.channel_config.events.get(
-                    'x-vrif-plus-2', set())):
-                msg = 'Verification of a change to %s succeeded: %s  %s' % (
-                    data['change']['project'],
-                    data['change']['subject'],
-                    data['change']['url'])
-                self.log.info('Compiled Message %s: %s' % (channel, msg))
-                self.ircbot.send(channel, msg)
-
-            if (approval['type'] == 'CRVW' and approval['value'] == '-2'
-                and channel in self.channel_config.events.get(
-                    'x-crvw-minus-2', set())):
-                msg = 'A change to %s has been rejected: %s  %s' % (
-                    data['change']['project'],
-                    data['change']['subject'],
-                    data['change']['url'])
-                self.log.info('Compiled Message %s: %s' % (channel, msg))
-                self.ircbot.send(channel, msg)
-
-            if (approval['type'] == 'CRVW' and approval['value'] == '2'
-                and channel in self.channel_config.events.get(
-                    'x-crvw-plus-2', set())):
-                msg = 'A change to %s has been approved: %s  %s' % (
-                    data['change']['project'],
-                    data['change']['subject'],
-                    data['change']['url'])
-                self.log.info('Compiled Message %s: %s' % (channel, msg))
-                self.ircbot.send(channel, msg)
-
-    def change_merged(self, channel, data):
-        msg = 'Merged %s: %s  %s' % (
-            data['change']['project'],
-            data['change']['subject'],
-            data['change']['url'])
-        self.log.info('Compiled Message %s: %s' % (channel, msg))
-        self.ircbot.send(channel, msg)
-
     def _read(self, data):
-        try:
-            if data['type'] == 'ref-updated':
-                channel_set = self.channel_config.events.get('ref-updated')
-            else:
-                channel_set = (self.channel_config.projects.get(
-                    data['change']['project'], set()) &
-                    self.channel_config.events.get(
+        for bot in self.bots:
+            channel_config = bot.channel_config
+            try:
+                if data['type'] == 'ref-updated':
+                    channel_set = channel_config.events.get('ref-updated')
+                else:
+                    channel_set = (channel_config.projects.get(
+                        data['change']['project'], set()) &
+                        channel_config.events.get(
                         data['type'], set()) &
-                    self.channel_config.branches.get(
+                        channel_config.branches.get(
                         data['change']['branch'], set()))
-        except KeyError:
-            # The data we care about was not present, no channels want
-            # this event.
-            channel_set = set()
-        self.log.info('Potential channels to receive event notification: %s' %
-                      channel_set)
-        for channel in channel_set:
-            if data['type'] == 'comment-added':
-                self.comment_added(channel, data)
-            elif data['type'] == 'patchset-created':
-                self.patchset_created(channel, data)
-            elif data['type'] == 'change-merged':
-                self.change_merged(channel, data)
-            elif data['type'] == 'ref-updated':
-                self.ref_updated(channel, data)
+            except KeyError:
+                # The data we care about was not present, no channels want
+                # this event.
+                channel_set = set()
+            self.log.info('Bot %s to receive potential '
+                          'event notifications: %s',
+                          bot.__class__.__name__, channel_set)
+            for channel in channel_set:
+                bot.dispatch_event(channel, data)
 
     def run(self):
         while True:
@@ -299,37 +305,36 @@ class ChannelConfig(object):
 
 def _main(config):
     setup_logging(config)
+    bots = []
 
     fp = config.get('ircbot', 'channel_config')
     if fp:
         fp = os.path.expanduser(fp)
         if not os.path.exists(fp):
             raise Exception("Unable to read layout config file at %s" % fp)
-    else:
-        raise Exception("Channel Config must be specified in config file.")
 
-    try:
-        channel_config = ChannelConfig(yaml.load(open(fp)))
-    except Exception:
-        log = logging.getLogger('gerritbot')
-        log.exception("Syntax error in chanel config file")
-        raise
+        try:
+            channel_config = ChannelConfig(yaml.load(open(fp)))
+        except Exception:
+            log = logging.getLogger('gerritbot')
+            log.exception("Syntax error in chanel config file")
+            raise
 
-    bot = GerritBot(channel_config.channels,
-                    config.get('ircbot', 'nick'),
-                    config.get('ircbot', 'pass'),
-                    config.get('ircbot', 'server'),
-                    config.getint('ircbot', 'port'),
-                    config.getboolean('ircbot', 'force_ssl'),
-                    config.get('ircbot', 'server_password'))
-    g = Gerrit(bot,
-               channel_config,
+        bots.append(GerritBot(channel_config,
+                              config.get('ircbot', 'nick'),
+                              config.get('ircbot', 'pass'),
+                              config.get('ircbot', 'server'),
+                              config.getint('ircbot', 'port'),
+                              config.getboolean('ircbot', 'force_ssl'),
+                              config.get('ircbot', 'server_password')))
+    g = Gerrit(bots,
                config.get('gerrit', 'host'),
                config.get('gerrit', 'user'),
                config.getint('gerrit', 'port'),
                config.get('gerrit', 'key'))
     g.start()
-    bot.start()
+    for bot in bots:
+        bot.start()
 
 
 def main():
